@@ -14,6 +14,9 @@ import idc
 import ida_auto
 import ida_kernwin
 import ida_idaapi
+import ida_undo
+import gc
+import ida_idp
 
 def get_idb_directory():
     """获取 IDB 文件所在目录"""
@@ -27,6 +30,28 @@ def ensure_dir(path):
     """确保目录存在"""
     if not os.path.exists(path):
         os.makedirs(path)
+
+def clear_undo_buffer():
+    """清理 IDA 撤销缓冲区，防止内存溢出"""
+    try:
+        ida_undo.clear_undo_buffer()
+        gc.collect()
+    except:
+        pass
+
+def disable_undo():
+    """禁用撤销功能（IDA 7.0+）"""
+    try:
+        ida_idp.disable_undo(True)
+    except:
+        pass
+
+def enable_undo():
+    """启用撤销功能"""
+    try:
+        ida_idp.disable_undo(False)
+    except:
+        pass
 
 def get_callers(func_ea):
     """获取调用当前函数的地址列表"""
@@ -60,19 +85,69 @@ def format_address_list(addr_list):
 
 def sanitize_filename(name):
     """清理函数名，使其适合作为文件名"""
-    # 替换不允许的文件名字符
     invalid_chars = '<>:"/\\|?*'
     for char in invalid_chars:
         name = name.replace(char, '_')
-    # 替换点号（避免与扩展名混淆）
     name = name.replace('.', '_')
-    # 限制长度
     if len(name) > 200:
         name = name[:200]
     return name
 
-def export_decompiled_functions(export_dir):
-    """导出所有函数的反编译代码"""
+def save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs):
+    """保存当前进度到文件"""
+    progress_file = os.path.join(export_dir, ".export_progress")
+    try:
+        with open(progress_file, 'w', encoding='utf-8') as f:
+            f.write("# Export Progress\n")
+            f.write("# Format: address | status (done/failed/skipped)\n")
+            for addr in processed_addrs:
+                f.write("{:X}|done\n".format(addr))
+            for addr, name, reason in failed_funcs:
+                f.write("{:X}|failed|{}|{}\n".format(addr, name, reason))
+            for addr, name, reason in skipped_funcs:
+                f.write("{:X}|skipped|{}|{}\n".format(addr, name, reason))
+    except Exception as e:
+        print("[!] Failed to save progress: {}".format(str(e)))
+
+def load_progress(export_dir):
+    """从文件加载进度"""
+    progress_file = os.path.join(export_dir, ".export_progress")
+    processed = set()
+    failed = []
+    skipped = []
+    
+    if not os.path.exists(progress_file):
+        return processed, failed, skipped
+    
+    try:
+        with open(progress_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    addr = int(parts[0], 16)
+                    status = parts[1]
+                    if status == 'done':
+                        processed.add(addr)
+                    elif status == 'failed' and len(parts) >= 4:
+                        failed.append((addr, parts[2], parts[3]))
+                    elif status == 'skipped' and len(parts) >= 4:
+                        skipped.append((addr, parts[2], parts[3]))
+        print("[+] Loaded progress: {} functions already processed".format(len(processed)))
+    except Exception as e:
+        print("[!] Failed to load progress: {}".format(str(e)))
+    
+    return processed, failed, skipped
+
+def export_decompiled_functions(export_dir, skip_existing=True):
+    """导出所有函数的反编译代码
+    
+    Args:
+        export_dir: 导出目录
+        skip_existing: 是否跳过已存在的文件
+    """
     decompile_dir = os.path.join(export_dir, "decompile")
     ensure_dir(decompile_dir)
 
@@ -80,26 +155,44 @@ def export_decompiled_functions(export_dir):
     exported_funcs = 0
     failed_funcs = []
     skipped_funcs = []
-    function_index = []  # 用于生成索引文件
-    addr_to_info = {}  # 地址到函数信息的映射
+    function_index = []
+    addr_to_info = {}
+
+    # 加载之前的进度
+    processed_addrs, prev_failed, prev_skipped = load_progress(export_dir)
+    failed_funcs.extend(prev_failed)
+    skipped_funcs.extend(prev_skipped)
 
     # 收集所有函数地址
     all_funcs = list(idautils.Functions())
     total_funcs = len(all_funcs)
+    
+    # 过滤掉已处理的函数
+    remaining_funcs = [ea for ea in all_funcs if ea not in processed_addrs]
+    
+    print("[*] Found {} functions total, {} remaining to process".format(total_funcs, len(remaining_funcs)))
+    
+    if len(remaining_funcs) == 0:
+        print("[+] All functions already exported!")
+        return
 
-    print("[*] Found {} functions to decompile".format(total_funcs))
-
-    for func_ea in all_funcs:
+    # 批量处理参数 - 更激进的清理策略
+    BATCH_SIZE = 20  # 每20个函数保存一次（减少内存占用）
+    UNDO_CLEAR_INTERVAL = 10  # 每10个函数清理撤销缓冲区
+    
+    for idx, func_ea in enumerate(remaining_funcs):
         func_name = idc.get_func_name(func_ea)
 
         # 跳过外部函数和导入函数
         func = ida_funcs.get_func(func_ea)
         if func is None:
             skipped_funcs.append((func_ea, func_name, "not a valid function"))
+            processed_addrs.add(func_ea)
             continue
 
         if func.flags & ida_funcs.FUNC_LIB:
             skipped_funcs.append((func_ea, func_name, "library function"))
+            processed_addrs.add(func_ea)
             continue
 
         try:
@@ -107,11 +200,13 @@ def export_decompiled_functions(export_dir):
             dec_obj = ida_hexrays.decompile(func_ea)
             if dec_obj is None:
                 failed_funcs.append((func_ea, func_name, "decompile returned None"))
+                processed_addrs.add(func_ea)
                 continue
 
             dec_str = str(dec_obj)
             if not dec_str or len(dec_str.strip()) == 0:
                 failed_funcs.append((func_ea, func_name, "empty decompilation result"))
+                processed_addrs.add(func_ea)
                 continue
 
             callers = get_callers(func_ea)
@@ -127,22 +222,26 @@ def export_decompiled_functions(export_dir):
             output_lines.append("")
             output_lines.append(dec_str)
 
-            # 使用函数地址作为文件名
             output_filename = "{:X}.c".format(func_ea)
-
             output_path = os.path.join(decompile_dir, output_filename)
+            
+            # 如果文件已存在且skip_existing为True，则跳过
+            if skip_existing and os.path.exists(output_path):
+                exported_funcs += 1
+                processed_addrs.add(func_ea)
+                if exported_funcs % 100 == 0:
+                    print("[+] Exported {} / {} functions...".format(exported_funcs + len(prev_failed) + len(prev_skipped), total_funcs))
+                continue
 
-            # 写入文件并确保刷新
             try:
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(output_lines))
                     f.flush()
-                    os.fsync(f.fileno())
             except IOError as io_err:
                 failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(io_err))))
+                processed_addrs.add(func_ea)
                 continue
 
-            # 记录到索引和映射表
             func_info = {
                 'address': func_ea,
                 'name': func_name,
@@ -154,17 +253,33 @@ def export_decompiled_functions(export_dir):
             addr_to_info[func_ea] = func_info
 
             exported_funcs += 1
+            processed_addrs.add(func_ea)
 
+            # 定期输出进度
             if exported_funcs % 100 == 0:
-                print("[+] Exported {} / {} functions...".format(exported_funcs, total_funcs))
-
+                print("[+] Exported {} / {} functions...".format(exported_funcs + len(prev_failed) + len(prev_skipped), total_funcs))
+            
+            # 定期清理撤销缓冲区，防止内存溢出
+            if (idx + 1) % UNDO_CLEAR_INTERVAL == 0:
+                clear_undo_buffer()
+            
+            # 定期保存进度和清理内存
+            if (idx + 1) % BATCH_SIZE == 0:
+                save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
+                gc.collect()
+                
         except ida_hexrays.DecompilationFailure as e:
             failed_funcs.append((func_ea, func_name, "decompilation failure: {}".format(str(e))))
+            processed_addrs.add(func_ea)
             continue
         except Exception as e:
             failed_funcs.append((func_ea, func_name, "unexpected error: {}".format(str(e))))
             print("[!] Error decompiling {} at {}: {}".format(func_name, hex(func_ea), str(e)))
+            processed_addrs.add(func_ea)
             continue
+    
+    # 最终保存进度
+    save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
     
     print("\n[*] Decompilation Summary:")
     print("    Total functions: {}".format(total_funcs))
@@ -209,7 +324,6 @@ def export_decompiled_functions(export_dir):
                 f.write("File: {}\n".format(func_info['filename']))
                 f.write("\n")
 
-                # 写入调用者信息
                 if func_info['callers']:
                     f.write("Called by ({} callers):\n".format(len(func_info['callers'])))
                     for caller_addr in func_info['callers']:
@@ -228,7 +342,6 @@ def export_decompiled_functions(export_dir):
 
                 f.write("\n")
 
-                # 写入被调用函数信息
                 if func_info['callees']:
                     f.write("Calls ({} callees):\n".format(len(func_info['callees'])))
                     for callee_addr in func_info['callees']:
@@ -254,12 +367,14 @@ def export_strings(export_dir):
     strings_path = os.path.join(export_dir, "strings.txt")
     
     string_count = 0
+    BATCH_SIZE = 500  # 每500个字符串清理一次
+    
     with open(strings_path, 'w', encoding='utf-8') as f:
         f.write("# Strings exported from IDA\n")
         f.write("# Format: address | length | type | string\n")
         f.write("#" + "=" * 80 + "\n\n")
         
-        for s in idautils.Strings():
+        for idx, s in enumerate(idautils.Strings()):
             try:
                 string_content = str(s)
                 str_type = "ASCII"
@@ -275,6 +390,11 @@ def export_strings(export_dir):
                     string_content.replace('\n', '\\n').replace('\r', '\\r')
                 ))
                 string_count += 1
+                
+                # 定期清理撤销缓冲区
+                if (idx + 1) % BATCH_SIZE == 0:
+                    clear_undo_buffer()
+                    
             except Exception as e:
                 continue
     
@@ -363,6 +483,13 @@ def export_memory(export_dir):
             filename = "{:08X}--{:08X}.txt".format(current_addr, chunk_end)
             filepath = os.path.join(memory_dir, filename)
             
+            # 跳过已存在的文件
+            if os.path.exists(filepath):
+                file_count += 1
+                current_addr = chunk_end
+                total_bytes += (chunk_end - current_addr)
+                continue
+            
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write("# Memory dump: {} - {}\n".format(hex(current_addr), hex(chunk_end)))
                 f.write("# Segment: {}\n".format(seg_name))
@@ -412,21 +539,31 @@ def export_memory(export_dir):
             
             file_count += 1
             current_addr = chunk_end
+            
+            # 每处理完一个chunk清理一次撤销缓冲区
+            clear_undo_buffer()
     
     print("\n[*] Memory Export Summary:")
     print("    Total bytes exported: {} ({:.2f} MB)".format(total_bytes, total_bytes / (1024*1024)))
     print("    Files created: {}".format(file_count))
 
-def do_export(export_dir=None, ask_user=True):
+def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False):
     """执行导出操作
 
     Args:
         export_dir: 导出目录路径，如果为None则使用默认或询问用户
         ask_user: 是否询问用户选择目录
+        skip_auto_analysis: 是否跳过等待自动分析（如果已经分析完成）
     """
     print("=" * 60)
     print("IDA Export for AI Analysis")
     print("=" * 60)
+    
+    # 初始清理
+    clear_undo_buffer()
+    
+    # 尝试禁用撤销功能以减少内存使用
+    disable_undo()
 
     if not ida_hexrays.init_hexrays_plugin():
         print("[!] Hex-Rays decompiler is not available!")
@@ -436,29 +573,40 @@ def do_export(export_dir=None, ask_user=True):
         has_hexrays = True
         print("[+] Hex-Rays decompiler initialized")
 
-    print("[*] Waiting for auto-analysis to complete...")
-    ida_auto.auto_wait()
+    if not skip_auto_analysis:
+        print("[*] Waiting for auto-analysis to complete...")
+        print("[*] Tip: This may take a while for large files. Press Ctrl+Break to cancel.")
+        
+        # 在auto_wait之前清理一次
+        clear_undo_buffer()
+        
+        ida_auto.auto_wait()
+        
+        # auto_wait之后立即清理
+        clear_undo_buffer()
+    else:
+        print("[*] Skipping auto-analysis wait (assuming already complete)")
 
     if export_dir is None:
         idb_dir = get_idb_directory()
         default_export_dir = os.path.join(idb_dir, "export-for-ai")
 
         if ask_user:
-            # 询问用户是否使用默认目录
             choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
                 "Export to default directory?\n\n{}\n\nYes: Use default directory\nNo: Choose custom directory\nCancel: Abort export".format(default_export_dir))
 
             if choice == ida_kernwin.ASKBTN_CANCEL:
                 print("[*] Export cancelled by user")
+                enable_undo()
                 return
             elif choice == ida_kernwin.ASKBTN_NO:
-                # 让用户输入目录路径
                 selected_dir = ida_kernwin.ask_str(default_export_dir, 0, "Enter export directory path:")
                 if selected_dir:
                     export_dir = selected_dir
                     print("[*] Using custom directory: {}".format(export_dir))
                 else:
                     print("[*] Export cancelled by user")
+                    enable_undo()
                     return
             else:
                 export_dir = default_export_dir
@@ -472,24 +620,32 @@ def do_export(export_dir=None, ask_user=True):
 
     print("[*] Exporting strings...")
     export_strings(export_dir)
+    clear_undo_buffer()
     print("")
 
     print("[*] Exporting imports...")
     export_imports(export_dir)
+    clear_undo_buffer()
     print("")
 
     print("[*] Exporting exports...")
     export_exports(export_dir)
+    clear_undo_buffer()
     print("")
 
     print("[*] Exporting memory...")
     export_memory(export_dir)
+    clear_undo_buffer()
     print("")
 
     if has_hexrays:
         print("[*] Exporting decompiled functions...")
-        export_decompiled_functions(export_dir)
+        print("[*] Tip: If IDA crashes, you can restart and the export will resume from where it left off")
+        export_decompiled_functions(export_dir, skip_existing=True)
 
+    # 恢复撤销功能
+    enable_undo()
+    
     print("")
     print("=" * 60)
     print("[+] Export completed!")
@@ -522,7 +678,19 @@ class ExportForAIPlugin(ida_idaapi.plugin_t):
     def run(self, arg):
         """插件运行"""
         try:
-            do_export()
+            # 询问是否跳过自动分析（如果用户已经分析完成）
+            choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
+                "Has the auto-analysis already completed?\n\n"
+                "Yes: Skip waiting for auto-analysis (faster)\n"
+                "No: Wait for auto-analysis to complete\n"
+                "Cancel: Abort export")
+            
+            if choice == ida_kernwin.ASKBTN_CANCEL:
+                print("[*] Export cancelled by user")
+                return
+            
+            skip_analysis = (choice == ida_kernwin.ASKBTN_YES)
+            do_export(skip_auto_analysis=skip_analysis)
         except Exception as e:
             print("[!] Export failed: {}".format(str(e)))
             import traceback
@@ -548,11 +716,16 @@ if __name__ == "__main__":
     argc = int(idc.eval_idc("ARGV.count"))
     if argc < 2:
         export_dir = None
+        skip_analysis = False
+    elif argc < 3:
+        export_dir = idc.eval_idc("ARGV[1]")
+        skip_analysis = False
     else:
         export_dir = idc.eval_idc("ARGV[1]")
+        skip_analysis = (idc.eval_idc("ARGV[2]") == "1")
 
     # 批处理模式不询问用户
-    do_export(export_dir, ask_user=False)
+    do_export(export_dir, ask_user=False, skip_auto_analysis=skip_analysis)
 
     # 只在批处理模式下退出
     if argc >= 2:
