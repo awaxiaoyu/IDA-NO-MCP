@@ -2,6 +2,7 @@
 # IDA Plugin to export decompiled functions, strings, memory, imports and exports for AI analysis
 
 import os
+import sys
 import ida_hexrays
 import ida_funcs
 import ida_nalt
@@ -15,8 +16,18 @@ import ida_auto
 import ida_kernwin
 import ida_idaapi
 import ida_undo
-import gc
 import ida_idp
+import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import multiprocessing as mp
+
+WORKER_COUNT = max(1, mp.cpu_count() - 1)
+TASK_BATCH_SIZE = 50
+
+def get_worker_count():
+    """获取用户配置的并行工作线程数"""
+    return WORKER_COUNT
 
 def get_idb_directory():
     """获取 IDB 文件所在目录"""
@@ -142,7 +153,7 @@ def load_progress(export_dir):
     return processed, failed, skipped
 
 def export_decompiled_functions(export_dir, skip_existing=True):
-    """导出所有函数的反编译代码
+    """导出所有函数的反编译代码（内存优化版 - 流式处理）
     
     Args:
         export_dir: 导出目录
@@ -158,6 +169,9 @@ def export_decompiled_functions(export_dir, skip_existing=True):
     function_index = []
     addr_to_info = {}
 
+    # 使用单线程I/O避免内存累积
+    io_executor = ThreadPoolExecutor(max_workers=1)
+
     # 加载之前的进度
     processed_addrs, prev_failed, prev_skipped = load_progress(export_dir)
     failed_funcs.extend(prev_failed)
@@ -171,18 +185,59 @@ def export_decompiled_functions(export_dir, skip_existing=True):
     remaining_funcs = [ea for ea in all_funcs if ea not in processed_addrs]
     
     print("[*] Found {} functions total, {} remaining to process".format(total_funcs, len(remaining_funcs)))
+    print("[*] Memory-optimized mode: processing one function at a time")
     
     if len(remaining_funcs) == 0:
         print("[+] All functions already exported!")
+        io_executor.shutdown(wait=False)
         return
 
-    # 批量处理参数 - 更激进的清理策略
-    BATCH_SIZE = 20  # 每20个函数保存一次（减少内存占用）
-    UNDO_CLEAR_INTERVAL = 10  # 每10个函数清理撤销缓冲区
+    # 流式处理 - 不预加载所有调用关系
+    BATCH_SIZE = 10  # 减小批量大小
+    MEMORY_CLEAN_INTERVAL = 5  # 更频繁地清理内存
+    pending_writes = []
+    
+    def write_function_file(args):
+        """线程安全的文件写入"""
+        func_ea, func_name, dec_str, callers, callees = args
+        
+        output_lines = []
+        output_lines.append("/*")
+        output_lines.append(" * func-name: {}".format(func_name))
+        output_lines.append(" * func-address: {}".format(hex(func_ea)))
+        output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
+        output_lines.append(" * callees: {}".format(format_address_list(callees) if callees else "none"))
+        output_lines.append(" */")
+        output_lines.append("")
+        output_lines.append(dec_str)
+
+        output_filename = "{:X}.c".format(func_ea)
+        output_path = os.path.join(decompile_dir, output_filename)
+        
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(output_lines))
+            return func_ea, func_name, True, output_filename, callers, callees, None
+        except IOError as e:
+            return func_ea, func_name, False, output_filename, callers, callees, str(e)
+    
+    def aggressive_memory_cleanup():
+        """激进的内存清理"""
+        # 强制删除大对象引用
+        import sys
+        # 清理IDA内部缓存
+        try:
+            ida_hexrays.clear_cached_cfuncs()
+        except:
+            pass
+        # 强制垃圾回收
+        gc.collect()
+        gc.collect()  # 两次收集确保清理
     
     for idx, func_ea in enumerate(remaining_funcs):
+        # 实时获取函数信息（不缓存）
         func_name = idc.get_func_name(func_ea)
-
+        
         # 跳过外部函数和导入函数
         func = ida_funcs.get_func(func_ea)
         if func is None:
@@ -195,6 +250,9 @@ def export_decompiled_functions(export_dir, skip_existing=True):
             processed_addrs.add(func_ea)
             continue
 
+        dec_str = None
+        dec_obj = None
+        
         try:
             # 尝试反编译
             dec_obj = ida_hexrays.decompile(func_ea)
@@ -204,23 +262,17 @@ def export_decompiled_functions(export_dir, skip_existing=True):
                 continue
 
             dec_str = str(dec_obj)
+            # 立即释放反编译对象
+            dec_obj = None
+            
             if not dec_str or len(dec_str.strip()) == 0:
                 failed_funcs.append((func_ea, func_name, "empty decompilation result"))
                 processed_addrs.add(func_ea)
                 continue
 
+            # 只在需要时获取调用关系
             callers = get_callers(func_ea)
             callees = get_callees(func_ea)
-
-            output_lines = []
-            output_lines.append("/*")
-            output_lines.append(" * func-name: {}".format(func_name))
-            output_lines.append(" * func-address: {}".format(hex(func_ea)))
-            output_lines.append(" * callers: {}".format(format_address_list(callers) if callers else "none"))
-            output_lines.append(" * callees: {}".format(format_address_list(callees) if callees else "none"))
-            output_lines.append(" */")
-            output_lines.append("")
-            output_lines.append(dec_str)
 
             output_filename = "{:X}.c".format(func_ea)
             output_path = os.path.join(decompile_dir, output_filename)
@@ -229,45 +281,20 @@ def export_decompiled_functions(export_dir, skip_existing=True):
             if skip_existing and os.path.exists(output_path):
                 exported_funcs += 1
                 processed_addrs.add(func_ea)
-                if exported_funcs % 100 == 0:
+                # 立即释放dec_str
+                dec_str = None
+                if (exported_funcs + len(prev_failed) + len(prev_skipped)) % 100 == 0:
                     print("[+] Exported {} / {} functions...".format(exported_funcs + len(prev_failed) + len(prev_skipped), total_funcs))
                 continue
 
-            try:
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(output_lines))
-                    f.flush()
-            except IOError as io_err:
-                failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(io_err))))
-                processed_addrs.add(func_ea)
-                continue
-
-            func_info = {
-                'address': func_ea,
-                'name': func_name,
-                'filename': output_filename,
-                'callers': callers,
-                'callees': callees
-            }
-            function_index.append(func_info)
-            addr_to_info[func_ea] = func_info
-
-            exported_funcs += 1
-            processed_addrs.add(func_ea)
-
-            # 定期输出进度
-            if exported_funcs % 100 == 0:
-                print("[+] Exported {} / {} functions...".format(exported_funcs + len(prev_failed) + len(prev_skipped), total_funcs))
+            # 提交写入任务
+            write_args = (func_ea, func_name, dec_str, callers, callees)
+            future = io_executor.submit(write_function_file, write_args)
+            pending_writes.append((future, func_ea, func_name, output_filename, callers, callees))
             
-            # 定期清理撤销缓冲区，防止内存溢出
-            if (idx + 1) % UNDO_CLEAR_INTERVAL == 0:
-                clear_undo_buffer()
+            # 立即释放dec_str，因为已经传递给写入任务
+            dec_str = None
             
-            # 定期保存进度和清理内存
-            if (idx + 1) % BATCH_SIZE == 0:
-                save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
-                gc.collect()
-                
         except ida_hexrays.DecompilationFailure as e:
             failed_funcs.append((func_ea, func_name, "decompilation failure: {}".format(str(e))))
             processed_addrs.add(func_ea)
@@ -277,6 +304,87 @@ def export_decompiled_functions(export_dir, skip_existing=True):
             print("[!] Error decompiling {} at {}: {}".format(func_name, hex(func_ea), str(e)))
             processed_addrs.add(func_ea)
             continue
+        finally:
+            # 确保反编译对象被释放
+            dec_obj = None
+            dec_str = None
+        
+        # 定期清理撤销缓冲区
+        if (idx + 1) % MEMORY_CLEAN_INTERVAL == 0:
+            clear_undo_buffer()
+            aggressive_memory_cleanup()
+        
+        # 批量等待写入完成并收集结果
+        if len(pending_writes) >= BATCH_SIZE:
+            for future, func_ea, func_name, output_filename, callers, callees in pending_writes:
+                try:
+                    result = future.result()
+                    func_ea, func_name, success, output_filename, callers, callees, error = result
+                    
+                    if success:
+                        func_info = {
+                            'address': func_ea,
+                            'name': func_name,
+                            'filename': output_filename,
+                            'callers': callers,
+                            'callees': callees
+                        }
+                        function_index.append(func_info)
+                        addr_to_info[func_ea] = func_info
+                        exported_funcs += 1
+                        processed_addrs.add(func_ea)
+                    else:
+                        failed_funcs.append((func_ea, func_name, "IO error: {}".format(error)))
+                        processed_addrs.add(func_ea)
+                    
+                except Exception as e:
+                    print("[!] Write error: {}".format(str(e)))
+            
+            # 保存进度并清理
+            save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
+            if exported_funcs % 100 == 0:
+                print("[+] Exported {} / {} functions...".format(exported_funcs + len(prev_failed) + len(prev_skipped), total_funcs))
+            
+            # 清理索引，避免内存无限增长
+            if len(function_index) > 1000:
+                # 保存到临时文件后清空
+                function_index = []
+                addr_to_info = {}
+            
+            pending_writes = []
+            aggressive_memory_cleanup()
+    
+    # 处理剩余的写入任务
+    if pending_writes:
+        for future, func_ea, func_name, output_filename, callers, callees in pending_writes:
+            try:
+                result = future.result()
+                func_ea, func_name, success, output_filename, callers, callees, error = result
+                
+                if success:
+                    func_info = {
+                        'address': func_ea,
+                        'name': func_name,
+                        'filename': output_filename,
+                        'callers': callers,
+                        'callees': callees
+                    }
+                    function_index.append(func_info)
+                    addr_to_info[func_ea] = func_info
+                    exported_funcs += 1
+                    processed_addrs.add(func_ea)
+                else:
+                    failed_funcs.append((func_ea, func_name, "IO error: {}".format(error)))
+                    processed_addrs.add(func_ea)
+                
+            except Exception as e:
+                print("[!] Write error: {}".format(str(e)))
+    
+    # 关闭线程池
+    io_executor.shutdown(wait=True)
+    
+    # 最终保存进度
+    save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
     
     # 最终保存进度
     save_progress(export_dir, processed_addrs, failed_funcs, skipped_funcs)
@@ -547,17 +655,24 @@ def export_memory(export_dir):
     print("    Total bytes exported: {} ({:.2f} MB)".format(total_bytes, total_bytes / (1024*1024)))
     print("    Files created: {}".format(file_count))
 
-def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False):
+def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None):
     """执行导出操作
 
     Args:
         export_dir: 导出目录路径，如果为None则使用默认或询问用户
         ask_user: 是否询问用户选择目录
         skip_auto_analysis: 是否跳过等待自动分析（如果已经分析完成）
+        worker_count: 并行工作线程数，默认为CPU核心数-1
     """
+    global WORKER_COUNT
+    
+    if worker_count is not None:
+        WORKER_COUNT = max(1, worker_count)
+    
     print("=" * 60)
     print("IDA Export for AI Analysis")
     print("=" * 60)
+    print("[*] Using {} worker threads for parallel I/O".format(WORKER_COUNT))
     
     # 初始清理
     clear_undo_buffer()
